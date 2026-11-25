@@ -5,10 +5,10 @@
 //
 // 用法：
 //
-//	A: chainsync -name A -listen :9030 -dir /data/upload
-//	B: chainsync -name B -listen :9030 -dir /data/upload -upstream http://A:9030
-//	C: chainsync -name C -listen :9030 -dir /data/upload -upstream http://B:9030
-//	D: chainsync -name D -listen :9030 -dir /data/upload -upstream http://C:9030
+//	A: chainsync -name A -listen :9030 -dir /data/upload/chain_sync
+//	B: chainsync -name B -listen :9030 -dir /data/upload/chain_sync -upstream http://A:9030
+//	C: chainsync -name C -listen :9030 -dir /data/upload/chain_sync -upstream http://B:9030
+//	D: chainsync -name D -listen :9030 -dir /data/upload/chain_sync -upstream http://C:9030
 package main
 
 import (
@@ -36,7 +36,7 @@ import (
 type Config struct {
 	Name     string        // 节点名 A/B/C/D
 	Listen   string        // 监听地址，如 :9030
-	Dir      string        // 同步目录，如 /data/upload
+	Dir      string        // 同步目录，如 /data/upload/chain_sync
 	Upstream string        // 上游节点 URL，如 http://A:9030；空 = 源头节点
 	Interval time.Duration // 轮询上游的间隔
 }
@@ -58,7 +58,7 @@ type Node struct {
 func main() {
 	name := flag.String("name", "", "节点名 A/B/C/D")
 	listen := flag.String("listen", ":9030", "监听地址")
-	dir := flag.String("dir", "/data/upload", "同步目录")
+	dir := flag.String("dir", "/data/upload/chain_sync", "同步目录")
 	upstream := flag.String("upstream", "", "上游节点 URL，如 http://A:9030；空=源头")
 	interval := flag.Duration("interval", 5*time.Second, "轮询上游间隔")
 	flag.Parse()
@@ -261,8 +261,22 @@ func (n *Node) download(f FileInfo) error {
 		offset = st.Size()
 	}
 
-	tmp, err := os.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// Explicit seeks allow truncation on Windows as well as Linux.
+	tmp, err := os.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
+		return err
+	}
+	if offset > 0 && offset >= f.Size {
+		// A complete/oversized partial has no valid bytes=N- range.
+		// Download afresh so an old same-size file is still hash-verified.
+		if err := tmp.Truncate(0); err != nil {
+			tmp.Close()
+			return err
+		}
+		offset = 0
+	}
+	if _, err := tmp.Seek(offset, io.SeekStart); err != nil {
+		tmp.Close()
 		return err
 	}
 
@@ -283,9 +297,24 @@ func (n *Node) download(f FileInfo) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && offset > 0 {
+		// The source may have changed after /list. Do not repeat the same
+		// invalid range forever; next poll refreshes metadata and starts over.
+		resetErr := tmp.Truncate(0)
+		tmp.Close()
+		if resetErr != nil {
+			return fmt.Errorf("上游返回 416，重置临时文件失败: %w", resetErr)
+		}
+		return fmt.Errorf("上游返回 416，已重置失效续传位置 %d，下轮从头重试", offset)
+	}
+
 	if offset > 0 && resp.StatusCode == http.StatusOK {
 		// 上游不支持 Range，丢弃旧部分重下
 		if err := tmp.Truncate(0); err != nil {
+			tmp.Close()
+			return err
+		}
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			tmp.Close()
 			return err
 		}
